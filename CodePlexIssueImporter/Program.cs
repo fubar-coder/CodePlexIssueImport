@@ -9,6 +9,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
 using CodePlexIssueImporter.CodePlexModels;
+using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
 using Octokit;
 
@@ -21,12 +22,21 @@ namespace CodePlexIssueImporter
             MissingMemberHandling = MissingMemberHandling.Error,
         };
 
+        private static readonly MigrationComment _migrationComment = new MigrationComment();
+
         private static GitHubRequestThrottler _throttler;
 
         static async Task Main(string[] args)
         {
-            var userName = "fubar-coder";
-            var password = ")@M!pt/;x$eCg#iR;!bd";
+            var config = new ConfigurationBuilder()
+                .AddEnvironmentVariables()
+                .AddCommandLine(args)
+                .AddUserSecrets<Program>()
+                .Build();
+
+            var secrets = config.GetSection("SECRETS");
+            var userName = secrets?["GITHUB_USERNAME"];
+            var password = secrets?["GITHUB_PASSWORD"];
 
             var loadedIssues = LoadIssues(@"c:\Users\MarkJunker\Downloads\quickgraph\issues\").ToList();
 
@@ -93,30 +103,111 @@ namespace CodePlexIssueImporter
 
         private static async Task ImportIssuesAsync(GitHubClient client, Repository repository, List<(Uri url, CodePlexIssue issue)> loadedIssues)
         {
-            var oldIssues = (await client.Issue.GetAllForRepository(repository.Id, new ApiOptions() { PageSize = 1000 }))
+            var oldIssues = (await client.Issue.GetAllForRepository(
+                    repository.Id,
+                    new RepositoryIssueRequest() { State = ItemStateFilter.All },
+                    new ApiOptions() { PageSize = 1000 }))
                 .ToLookup(x => x.Title);
 
             foreach (var (url, issue) in loadedIssues)
             {
                 Console.WriteLine(issue.WorkItem.Id);
-                var gitHubIssue = await GetOrCreateIssueAsync(client, repository, url, issue, oldIssues);
+                var gitHubIssue = await GetOrCreateIssueAsync(client, repository, issue, oldIssues);
+                CopyAttachments(url, issue);
+                await AddIssueComments(client, repository, gitHubIssue, issue);
             }
         }
 
-        private static async Task<Issue> GetOrCreateIssueAsync(GitHubClient client, Repository repository, Uri codePlexIssueUrl, CodePlexIssue issue, ILookup<string, Issue> oldIssues)
+        private static void CopyAttachments(Uri codePlexIssueUrl, CodePlexIssue issue)
+        {
+            if ((issue.FileAttachments?.Count ?? 0) == 0)
+                return;
+
+            var outputPath = Path.Combine(new Uri(codePlexIssueUrl, "attachments").LocalPath);
+            Directory.CreateDirectory(outputPath);
+            foreach (var attachment in issue.FileAttachments)
+            {
+                var attachmentUrl = new Uri(codePlexIssueUrl, attachment.DownloadUrl);
+                var path = Path.Combine(outputPath, attachment.FileName);
+                if (!File.Exists(path))
+                    File.Copy(attachmentUrl.LocalPath, path);
+            }
+        }
+
+        private static async Task AddIssueComments(GitHubClient client, Repository repository, Issue gitHubIssue, CodePlexIssue codePlexIssue)
+        {
+            if (codePlexIssue.Comments == null || codePlexIssue.Comments.Count == 0)
+                return;
+
+            await _throttler.Throttle();
+            var gitHubIssueComments = await client.Issue.Comment.GetAllForIssue(repository.Id, gitHubIssue.Number);
+            var timestampToComments =
+                (from comment in gitHubIssueComments
+                 let info = _migrationComment.ParseMigrationComment(comment.Body)
+                 where info != null
+                 select new { info.Timestamp, comment })
+                 .ToDictionary(x => x.Timestamp, x => x.comment);
+
+            var wasClosed = gitHubIssue.ClosedAt != null;
+            foreach (var comment in codePlexIssue.Comments)
+            {
+                var textDate = string.Format(CultureInfo.InvariantCulture, "{0:F}", comment.PostedDate);
+                var parsedDate = DateTimeOffset.ParseExact(textDate, "F", CultureInfo.InvariantCulture);
+                Console.WriteLine("\t{0}", textDate);
+                if (timestampToComments.ContainsKey(parsedDate))
+                    continue;
+
+                var isEmpty = string.IsNullOrWhiteSpace(comment.Message);
+                var isClosingIssue = codePlexIssue.WorkItem.ClosedDate != null && codePlexIssue.WorkItem.ClosedDate.Value == comment.PostedDate;
+
+                if (!isEmpty || (isClosingIssue && !wasClosed))
+                {
+                    await _throttler.Throttle();
+                    var migrationInfo = new MigrationInfo { Timestamp = comment.PostedDate, };
+                    var message = _migrationComment.AddMigrationComment(migrationInfo, comment.Message);
+                    var gitHubIssueComment = await client.Issue.Comment.Create(repository.Id, gitHubIssue.Number, message);
+                    _throttler.UpdateLastRequest();
+                }
+
+                if (!wasClosed && isClosingIssue)
+                {
+                    wasClosed = true;
+
+                    var issueUpdate = new IssueUpdate()
+                    {
+                        State = ItemState.Closed,
+                    };
+
+                    await _throttler.Throttle();
+                    await client.Issue.Update(repository.Id, gitHubIssue.Number, issueUpdate);
+                    _throttler.UpdateLastRequest();
+                }
+            }
+
+            if (!wasClosed && codePlexIssue.WorkItem.ClosedDate != null)
+            {
+                var issueUpdate = new IssueUpdate()
+                {
+                    State = ItemState.Closed,
+                };
+
+                await _throttler.Throttle();
+                await client.Issue.Update(repository.Id, gitHubIssue.Number, issueUpdate);
+                _throttler.UpdateLastRequest();
+            }
+        }
+
+        private static async Task<Issue> GetOrCreateIssueAsync(GitHubClient client, Repository repository, CodePlexIssue issue, ILookup<string, Issue> oldIssues)
         {
             var title = $"CP-{issue.WorkItem.Id}: {issue.WorkItem.Summary}";
             if (oldIssues.Contains(title))
                 return oldIssues[title].First();
 
-            var body = new StringBuilder();
-            body.AppendFormat(CultureInfo.InvariantCulture, "*From unknown CodePlex user on {0:F}*", issue.WorkItem.ReportedDate)
-                .AppendLine()
-                .AppendLine()
-                .Append(issue.WorkItem.Description);
+            var migrationInfo = new MigrationInfo { Timestamp = issue.WorkItem.ReportedDate };
+            var body = _migrationComment.AddMigrationComment(migrationInfo, issue.WorkItem.Description);
             var newIssue = new NewIssue(title)
             {
-                Body = body.ToString(),
+                Body = body,
             };
 
             var component = issue.WorkItem.AffectedComponent?.Name;

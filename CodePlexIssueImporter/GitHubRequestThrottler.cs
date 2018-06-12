@@ -8,12 +8,12 @@ namespace CodePlexIssueImporter
 {
     public class GitHubRequestThrottler
     {
-        private static readonly TimeSpan _minTimeSpan = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan _minTimeSpan = TimeSpan.FromSeconds(1);
         private readonly GitHubClient _client;
         private MiscellaneousRateLimit _rateLimit;
         private DateTimeOffset _lastRateLimit = DateTimeOffset.Now;
         private DateTimeOffset _lastRequest = DateTimeOffset.Now - TimeSpan.FromMinutes(1);
-        private TimeSpan _currentDelay = TimeSpan.FromSeconds(5);
+        private TimeSpan _currentDelay = TimeSpan.FromSeconds(1);
         private long _apiRemainingDifference = 0;
         private long _lastApiRemaining = int.MaxValue;
 
